@@ -1,0 +1,14 @@
+# CoreML model bundles (keep out of git)
+*.mlpackage/
+*.mlmodelc/
+
+# macOS and Xcode user-specific files
+.DS_Store
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+
+# Build outputs
+DerivedData/
+build/
