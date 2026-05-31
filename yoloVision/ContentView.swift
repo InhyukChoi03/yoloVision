@@ -68,6 +68,14 @@ struct ContentView: View {
                 }
                 .frame(maxWidth: .infinity)
 
+                Toggle(isOn: $detectionService.isVoiceEnabled) {
+                    Text("음성 안내")
+                        .font(.callout)
+                        .foregroundStyle(.white)
+                }
+                .tint(.green)
+                .frame(maxWidth: .infinity)
+
                 Button("실행") {
                     currentScreen = .camera
                     Task {
@@ -159,6 +167,8 @@ struct ContentView: View {
                     Spacer()
                 }
 
+                VoiceStatusBadge(speech: detectionService.speech)
+
                 if detectionService.isModelReady {
                     HStack {
                         Text(detectionService.livePerformanceLog)
@@ -221,16 +231,28 @@ struct ContentView: View {
 
                     Button("멈춤") {
                         cameraManager.stop()
+                        detectionService.stopGuidance()
                     }
                     .buttonStyle(.bordered)
                     .disabled(!cameraManager.isRunning)
 
                     Button("메인메뉴") {
                         cameraManager.stop()
+                        detectionService.stopGuidance()
                         currentScreen = .menu
                     }
                     .buttonStyle(.bordered)
                 }
+
+                Toggle(isOn: $detectionService.isVoiceEnabled) {
+                    Label("음성 안내", systemImage: detectionService.isVoiceEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                        .font(.callout)
+                }
+                .tint(.green)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(.ultraThinMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 
                 if !cameraManager.availableLenses.isEmpty {
                     Picker("렌즈", selection: $cameraManager.selectedLens) {
@@ -285,6 +307,7 @@ struct ContentView: View {
         }
         .onDisappear {
             cameraManager.clearFrameHandler()
+            detectionService.stopGuidance()
         }
     }
 
@@ -325,6 +348,28 @@ struct ContentView: View {
         let height = imageHeight * scale
 
         return CGRect(x: x, y: y, width: width, height: height)
+    }
+}
+
+private struct VoiceStatusBadge: View {
+    @ObservedObject var speech: SpeechService
+
+    var body: some View {
+        if speech.isEnabled, speech.isSpeaking, let text = speech.lastSpokenText {
+            HStack(spacing: 6) {
+                Image(systemName: "speaker.wave.2.fill")
+                Text(text)
+                    .lineLimit(1)
+            }
+            .font(.caption.weight(.semibold))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(.green.opacity(0.85))
+            .foregroundStyle(.white)
+            .clipShape(Capsule())
+            .padding(.top, 6)
+            .transition(.opacity)
+        }
     }
 }
 

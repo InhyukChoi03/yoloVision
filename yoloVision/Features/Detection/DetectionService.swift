@@ -21,6 +21,20 @@ final class DetectionService: ObservableObject {
     @Published private(set) var inferenceSampleCount: Int = 0
     @Published private(set) var livePerformanceLog: String = "추론 속도 측정 대기 중"
 
+    let speech = SpeechService()
+
+    @Published var isVoiceEnabled: Bool = true {
+        didSet {
+            speech.isEnabled = isVoiceEnabled
+            if !isVoiceEnabled {
+                labelAnnouncementTimes.removeAll()
+            }
+        }
+    }
+
+    private var labelAnnouncementTimes: [String: Date] = [:]
+    private let labelAnnouncementCooldown: TimeInterval = 3.0
+
     private let modelProvider = YOLOModelProvider()
     private let processingQueue = DispatchQueue(label: "yoloVision.detection.processing", qos: .userInitiated)
 
@@ -37,24 +51,50 @@ final class DetectionService: ObservableObject {
     private var totalInferenceSamples: Int = 0
     private var lastConsoleLogAt = Date.distantPast
 
+    /// 보행 보조에 의미 있는 COCO 클래스만 통과시킨다(나머지는 시계/침대/노트북 등 무시).
+    private let allowedLabels: Set<String> = [
+        "person",
+        "bicycle",
+        "car",
+        "motorcycle",
+        "bus",
+        "truck",
+        "train",
+        "dog",
+        "cat",
+        "traffic light",
+        "stop sign",
+        "fire hydrant",
+        "bench"
+    ]
+
+    /// 이동 장애물(우선 안내 + 더 낮은 신뢰도 임계값 적용).
     private let preferredLabels: Set<String> = [
-        "person", "door", "stairs", "stair", "staircase", "toilet", "wall", "chair", "clock"
+        "person",
+        "bicycle",
+        "car",
+        "motorcycle",
+        "bus",
+        "truck",
+        "train",
+        "dog",
+        "cat"
     ]
 
     private let koreanLabelMap: [String: String] = [
         "person": "사람",
-        "door": "문",
-        "stairs": "계단",
-        "stair": "계단",
-        "staircase": "계단",
-        "toilet": "변기",
-        "wall": "벽",
-        "chair": "의자",
-        "clock": "시계",
-        "bench": "벤치",
-        "couch": "소파",
-        "tv": "TV",
-        "dining table": "테이블"
+        "bicycle": "자전거",
+        "car": "자동차",
+        "motorcycle": "오토바이",
+        "bus": "버스",
+        "truck": "트럭",
+        "train": "기차",
+        "dog": "개",
+        "cat": "고양이",
+        "traffic light": "신호등",
+        "stop sign": "정지 표지판",
+        "fire hydrant": "소화전",
+        "bench": "벤치"
     ]
 
     init() {
@@ -77,10 +117,18 @@ final class DetectionService: ObservableObject {
         isModelReady = false
         latestDetections = []
         topDetectedLabels = []
+        labelAnnouncementTimes.removeAll()
+        speech.stop()
         resetPerformanceMetrics()
         unsupportedOutputTypeNotified = false
         modelProvider.clearLoadedModel()
         await startIfNeeded(forceReload: true)
+    }
+
+    /// 탐지를 멈출 때(정지/메뉴 복귀) 음성과 안내 상태를 정리한다.
+    func stopGuidance() {
+        speech.stop()
+        labelAnnouncementTimes.removeAll()
     }
 
     func startIfNeeded(forceReload: Bool = false) async {
@@ -160,6 +208,7 @@ final class DetectionService: ObservableObject {
                 let mapped = observations.compactMap { obs -> DetectedObject? in
                     guard let best = obs.labels.first else { return nil }
                     let normalized = best.identifier.lowercased()
+                    guard self.allowedLabels.contains(normalized) else { return nil }
                     guard best.confidence >= self.confidenceThreshold else { return nil }
 
                     let isPreferred = self.preferredLabels.contains(normalized)
@@ -192,6 +241,7 @@ final class DetectionService: ObservableObject {
                     if !mapped.isEmpty {
                         self.statusMessage = nil
                     }
+                    self.announceIfNeeded(mapped)
                 }
             } catch {
                 Task { @MainActor in
@@ -199,6 +249,44 @@ final class DetectionService: ObservableObject {
                 }
             }
         }
+    }
+
+    /// 보행에 중요한 객체 1개를 골라 방향과 함께 안내한다.
+    /// 라벨별 쿨다운으로 같은 객체의 반복 알림을 완화한다.
+    private func announceIfNeeded(_ detections: [DetectedObject]) {
+        guard isVoiceEnabled, !detections.isEmpty else { return }
+
+        let preferred = detections.filter { preferredLabels.contains($0.label.lowercased()) }
+        let pool = preferred.isEmpty ? detections : preferred
+        guard let candidate = pool.max(by: { $0.confidence < $1.confidence }) else { return }
+
+        let now = Date()
+        let key = candidate.localizedLabel
+        if let last = labelAnnouncementTimes[key], now.timeIntervalSince(last) < labelAnnouncementCooldown {
+            return
+        }
+
+        labelAnnouncementTimes[key] = now
+        pruneAnnouncements(now: now)
+
+        let phrase = "\(directionPhrase(for: candidate.boundingBox)) \(candidate.localizedLabel)"
+        speech.enqueue(phrase)
+    }
+
+    private func directionPhrase(for boundingBox: CGRect) -> String {
+        let midX = boundingBox.midX
+        if midX < 0.4 {
+            return "왼쪽에"
+        } else if midX > 0.6 {
+            return "오른쪽에"
+        } else {
+            return "정면에"
+        }
+    }
+
+    private func pruneAnnouncements(now: Date) {
+        let window = labelAnnouncementCooldown * 2
+        labelAnnouncementTimes = labelAnnouncementTimes.filter { now.timeIntervalSince($0.value) < window }
     }
 
     private func resetPerformanceMetrics() {
