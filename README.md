@@ -7,8 +7,10 @@ iPhone 후면 카메라로 주변 객체를 실시간으로 인식하고, 한국
 - 후면 카메라 실시간 프리뷰 (광각 / 초광각 / 망원 렌즈 전환)
 - Vision + CoreML 기반 YOLO 객체 탐지 및 바운딩 박스 오버레이
 - 여러 YOLO 모델 번들(yolov8n, yolo11s/m/l/x) 중 선택 / 자동 우선순위 로딩
-- 보행 중요 객체(사람·문·계단·의자 등) 우선 처리 및 한국어 라벨 표시
+- 보행 관련 COCO 클래스(사람/자동차/자전거/버스/트럭/신호등 등)만 필터링해 탐지
+- LiDAR 지원 Pro 기기에서 depth map을 함께 수집해 객체 **거리(m)** 추정
 - **한국어 TTS 음성 안내**: 방향(왼쪽/정면/오른쪽)과 객체명을 함께 안내
+  - 거리 추정이 가능하면 `정면 2.1미터 앞에 사람` 형태로 음성 안내
   - 직렬 발화로 겹침 방지, 최소 발화 간격 / 중복 문장 억제 / 라벨별 쿨다운
 - 실시간 추론 FPS·지연시간 성능 로그
 
@@ -16,6 +18,7 @@ iPhone 후면 카메라로 주변 객체를 실시간으로 인식하고, 한국
 
 - Xcode 26.3 이상
 - iOS 26.2 이상 실기기 (카메라·CoreML은 시뮬레이터에서 제한적)
+- 거리 안내(LiDAR depth)는 Pro 계열 iPhone/iPad Pro에서만 동작
 - Apple Developer 서명 계정
 
 ## 프로젝트 구조
@@ -28,7 +31,7 @@ yoloVision/
 │   └── DetectedObject.swift       # 탐지 결과 모델
 ├── Features/
 │   ├── Camera/
-│   │   ├── CameraManager.swift    # 권한·세션·렌즈 전환·프레임 콜백
+│   │   ├── CameraManager.swift    # 권한·세션·렌즈 전환·RGB+Depth 프레임 콜백
 │   │   └── CameraPreviewView.swift
 │   ├── Detection/
 │   │   ├── YOLOModelProvider.swift   # 번들 모델 탐색/로딩

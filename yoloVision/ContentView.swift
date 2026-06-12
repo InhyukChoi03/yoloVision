@@ -112,7 +112,7 @@ struct ContentView: View {
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
                             .stroke(Color.green, lineWidth: 2)
 
-                        Text("\(detection.localizedLabel) \(Int(detection.confidence * 100))%")
+                        Text(detectionBadgeText(for: detection))
                             .font(.caption2.bold())
                             .foregroundStyle(.white)
                             .padding(.horizontal, 6)
@@ -162,6 +162,16 @@ struct ContentView: View {
                             .background(.black.opacity(0.6))
                             .foregroundStyle(.white)
                             .clipShape(Capsule())
+
+                        if cameraManager.isLiDARSupported {
+                            Text(cameraManager.isDepthDataEnabled ? "LiDAR 거리 ON" : "LiDAR 거리 OFF")
+                                .font(.caption2)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 6)
+                                .background(cameraManager.isDepthDataEnabled ? .cyan.opacity(0.8) : .gray.opacity(0.7))
+                                .foregroundStyle(.white)
+                                .clipShape(Capsule())
+                        }
                     }
 
                     Spacer()
@@ -301,8 +311,8 @@ struct ContentView: View {
         }
         .onAppear {
             detectionService.refreshModelOptions()
-            cameraManager.setFrameHandler { pixelBuffer in
-                detectionService.handleFrame(pixelBuffer)
+            cameraManager.setFrameHandler { pixelBuffer, depthData in
+                detectionService.handleFrame(pixelBuffer, depthData: depthData)
             }
         }
         .onDisappear {
@@ -348,6 +358,14 @@ struct ContentView: View {
         let height = imageHeight * scale
 
         return CGRect(x: x, y: y, width: width, height: height)
+    }
+
+    private func detectionBadgeText(for detection: DetectedObject) -> String {
+        let base = "\(detection.localizedLabel) \(Int(detection.confidence * 100))%"
+        guard let distance = detection.estimatedDistanceMeters else {
+            return base
+        }
+        return base + String(format: " · %.1fm", distance)
     }
 }
 

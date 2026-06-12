@@ -34,6 +34,22 @@ final class DetectionService: ObservableObject {
 
     private var labelAnnouncementTimes: [String: Date] = [:]
     private let labelAnnouncementCooldown: TimeInterval = 3.0
+    private let urgentAnnouncementCooldown: TimeInterval = 2.5
+
+    /// 라벨별 마지막 "주의" 경고 시각. 지속적으로 가까운 동일 객체를 반복해서 끊지 않기 위해 사용.
+    private var lastUrgentAnnouncementTimes: [String: Date] = [:]
+
+    /// 이 거리(m) 이하이면 "주의" 경고로 안내한다.
+    private let nearWarningDistance: Float = 1.5
+
+    /// 음성 안내 전 최소 연속 관측 프레임 수(순간 오탐 억제). processingQueue에서만 갱신.
+    private var trackObservationCounts: [String: (count: Int, lastSeen: Date)] = [:]
+    private let minObservationsToAnnounce = 3
+
+    /// 라벨+대략 위치별 거리 EMA 상태(프레임 간 거리 튐 완화). processingQueue에서만 접근.
+    private var smoothedDistances: [String: (value: Float, timestamp: Date)] = [:]
+    private let distanceSmoothingFactor: Float = 0.4
+    private let distanceTrackTTL: TimeInterval = 1.0
 
     private let modelProvider = YOLOModelProvider()
     private let processingQueue = DispatchQueue(label: "yoloVision.detection.processing", qos: .userInitiated)
@@ -118,6 +134,11 @@ final class DetectionService: ObservableObject {
         latestDetections = []
         topDetectedLabels = []
         labelAnnouncementTimes.removeAll()
+        lastUrgentAnnouncementTimes.removeAll()
+        processingQueue.async {
+            self.smoothedDistances.removeAll()
+            self.trackObservationCounts.removeAll()
+        }
         speech.stop()
         resetPerformanceMetrics()
         unsupportedOutputTypeNotified = false
@@ -129,6 +150,11 @@ final class DetectionService: ObservableObject {
     func stopGuidance() {
         speech.stop()
         labelAnnouncementTimes.removeAll()
+        lastUrgentAnnouncementTimes.removeAll()
+        processingQueue.async {
+            self.smoothedDistances.removeAll()
+            self.trackObservationCounts.removeAll()
+        }
     }
 
     func startIfNeeded(forceReload: Bool = false) async {
@@ -161,7 +187,7 @@ final class DetectionService: ObservableObject {
         }
     }
 
-    func handleFrame(_ pixelBuffer: CVPixelBuffer) {
+    func handleFrame(_ pixelBuffer: CVPixelBuffer, depthData: CVPixelBuffer? = nil) {
         guard let request else { return }
 
         processingQueue.async {
@@ -217,6 +243,13 @@ final class DetectionService: ObservableObject {
                     }
 
                     let localizedLabel = self.koreanLabelMap[normalized] ?? best.identifier
+                    let rawDistance = self.estimateDistance(for: obs.boundingBox, depthData: depthData)
+                    let estimatedDistance = self.smoothedDistance(
+                        rawDistance: rawDistance,
+                        boundingBox: obs.boundingBox,
+                        label: normalized,
+                        now: now
+                    )
 
                     return DetectedObject(
                         label: best.identifier,
@@ -224,14 +257,24 @@ final class DetectionService: ObservableObject {
                         confidence: best.confidence,
                         boundingBox: obs.boundingBox,
                         imageSize: imageSize,
+                        estimatedDistanceMeters: estimatedDistance,
                         timestamp: now
                     )
                 }
 
+                self.pruneSmoothedDistances(now: now)
+                let stableKeys = self.updateTrackObservations(mapped, now: now)
+
                 let topLabels = mapped
                     .sorted(by: { $0.confidence > $1.confidence })
                     .prefix(3)
-                    .map { String(format: "%@ %.0f%%", $0.localizedLabel, $0.confidence * 100) }
+                    .map { detection in
+                        let base = String(format: "%@ %.0f%%", detection.localizedLabel, detection.confidence * 100)
+                        guard let distance = detection.estimatedDistanceMeters else {
+                            return base
+                        }
+                        return base + String(format: " %.1fm", distance)
+                    }
 
                 self.recordPerformanceSample(startedAt: inferenceStartedAt, now: now)
 
@@ -241,7 +284,7 @@ final class DetectionService: ObservableObject {
                     if !mapped.isEmpty {
                         self.statusMessage = nil
                     }
-                    self.announceIfNeeded(mapped)
+                    self.announceIfNeeded(mapped, stableKeys: stableKeys)
                 }
             } catch {
                 Task { @MainActor in
@@ -251,42 +294,171 @@ final class DetectionService: ObservableObject {
         }
     }
 
-    /// 보행에 중요한 객체 1개를 골라 방향과 함께 안내한다.
-    /// 라벨별 쿨다운으로 같은 객체의 반복 알림을 완화한다.
-    private func announceIfNeeded(_ detections: [DetectedObject]) {
+    /// 가장 가까운(거리 미상이면 신뢰도 높은) 객체 1개를 골라 방향·거리와 함께 안내한다.
+    /// - 순간적으로만 잡힌 오탐은 `stableKeys`(연속 관측된 트랙)만 후보로 삼아 거른다.
+    /// - 근접 시 "주의" 경고를 보내되, 같은 객체가 계속 가까이 있으면 진행 중 발화를 끊지 않는다.
+    private func announceIfNeeded(_ detections: [DetectedObject], stableKeys: Set<String>) {
         guard isVoiceEnabled, !detections.isEmpty else { return }
 
-        let preferred = detections.filter { preferredLabels.contains($0.label.lowercased()) }
-        let pool = preferred.isEmpty ? detections : preferred
-        guard let candidate = pool.max(by: { $0.confidence < $1.confidence }) else { return }
+        let stable = detections.filter {
+            stableKeys.contains(trackKey(label: $0.label.lowercased(), boundingBox: $0.boundingBox))
+        }
+        guard let candidate = selectAnnouncementCandidate(stable) else { return }
 
         let now = Date()
         let key = candidate.localizedLabel
-        if let last = labelAnnouncementTimes[key], now.timeIntervalSince(last) < labelAnnouncementCooldown {
+        let isUrgent = (candidate.estimatedDistanceMeters.map { $0 <= nearWarningDistance }) ?? false
+        let cooldown = isUrgent ? urgentAnnouncementCooldown : labelAnnouncementCooldown
+
+        if let last = labelAnnouncementTimes[key], now.timeIntervalSince(last) < cooldown {
             return
         }
 
+        // 같은 객체가 직전에도 "주의" 상태였다면 새로 끼어들지(force) 않고 자연스럽게 큐에 맡긴다.
+        // 처음 가까워진 순간에만 진행 중 발화를 끊어 즉시 경고한다.
+        let wasRecentlyUrgent = lastUrgentAnnouncementTimes[key]
+            .map { now.timeIntervalSince($0) < urgentAnnouncementCooldown * 2 } ?? false
+        let shouldInterrupt = isUrgent && !wasRecentlyUrgent
+
         labelAnnouncementTimes[key] = now
+        if isUrgent {
+            lastUrgentAnnouncementTimes[key] = now
+        }
         pruneAnnouncements(now: now)
 
-        let phrase = "\(directionPhrase(for: candidate.boundingBox)) \(candidate.localizedLabel)"
-        speech.enqueue(phrase)
+        let phrase = guidancePhrase(for: candidate, isUrgent: isUrgent)
+        speech.enqueue(phrase, force: shouldInterrupt)
+    }
+
+    /// 충돌 관련성이 가장 큰 객체를 선택한다.
+    /// - 거리 정보가 있으면 가장 가까운 객체(LiDAR 기기)
+    /// - 거리 정보가 없으면 이동 장애물 우선 + 최고 신뢰도(비 LiDAR 기기 기존 동작)
+    private func selectAnnouncementCandidate(_ detections: [DetectedObject]) -> DetectedObject? {
+        let withDistance = detections.filter { $0.estimatedDistanceMeters != nil }
+        if let nearest = withDistance.min(by: {
+            ($0.estimatedDistanceMeters ?? .greatestFiniteMagnitude) < ($1.estimatedDistanceMeters ?? .greatestFiniteMagnitude)
+        }) {
+            return nearest
+        }
+
+        let preferred = detections.filter { preferredLabels.contains($0.label.lowercased()) }
+        let pool = preferred.isEmpty ? detections : preferred
+        return pool.max(by: { $0.confidence < $1.confidence })
+    }
+
+    private func guidancePhrase(for detection: DetectedObject, isUrgent: Bool) -> String {
+        let direction = directionPhrase(for: detection.boundingBox)
+        guard let distance = detection.estimatedDistanceMeters, distance.isFinite else {
+            return "\(direction)에 \(detection.localizedLabel)"
+        }
+        if isUrgent {
+            return String(format: "주의, %@ %.1f미터 앞에 %@", direction, distance, detection.localizedLabel)
+        }
+        return String(format: "%@ %.1f미터 앞에 %@", direction, distance, detection.localizedLabel)
     }
 
     private func directionPhrase(for boundingBox: CGRect) -> String {
         let midX = boundingBox.midX
         if midX < 0.4 {
-            return "왼쪽에"
+            return "왼쪽"
         } else if midX > 0.6 {
-            return "오른쪽에"
+            return "오른쪽"
         } else {
-            return "정면에"
+            return "정면"
         }
+    }
+
+    /// Vision 정규화 bbox 중심점 주변 depth를 샘플링해 중앙값 거리(m)를 계산한다.
+    private func estimateDistance(for boundingBox: CGRect, depthData: CVPixelBuffer?) -> Float? {
+        guard let depthData else { return nil }
+        guard CVPixelBufferGetPixelFormatType(depthData) == kCVPixelFormatType_DepthFloat32 else { return nil }
+
+        CVPixelBufferLockBaseAddress(depthData, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(depthData, .readOnly) }
+
+        guard let baseAddress = CVPixelBufferGetBaseAddress(depthData) else { return nil }
+
+        let width = CVPixelBufferGetWidth(depthData)
+        let height = CVPixelBufferGetHeight(depthData)
+        guard width > 0, height > 0 else { return nil }
+
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(depthData)
+        let centerX = max(0, min(width - 1, Int(CGFloat(width) * boundingBox.midX)))
+        let centerY = max(0, min(height - 1, Int(CGFloat(height) * (1 - boundingBox.midY))))
+
+        let radius = 2
+        var samples: [Float] = []
+        samples.reserveCapacity((radius * 2 + 1) * (radius * 2 + 1))
+
+        for y in max(0, centerY - radius)...min(height - 1, centerY + radius) {
+            let rowPointer = baseAddress.advanced(by: y * bytesPerRow).assumingMemoryBound(to: Float32.self)
+            for x in max(0, centerX - radius)...min(width - 1, centerX + radius) {
+                let value = rowPointer[x]
+                if value.isFinite, value > 0.05, value < 12.0 {
+                    samples.append(value)
+                }
+            }
+        }
+
+        guard !samples.isEmpty else { return nil }
+        samples.sort()
+        return samples[samples.count / 2]
+    }
+
+    /// 라벨+대략 위치로 같은 객체를 추적해 거리를 EMA로 평활화한다(프레임 간 튐 완화).
+    /// processingQueue에서만 호출된다.
+    private func smoothedDistance(rawDistance: Float?, boundingBox: CGRect, label: String, now: Date) -> Float? {
+        guard let raw = rawDistance else { return nil }
+
+        let key = trackKey(label: label, boundingBox: boundingBox)
+        let blended: Float
+        if let previous = smoothedDistances[key], now.timeIntervalSince(previous.timestamp) < distanceTrackTTL {
+            blended = distanceSmoothingFactor * raw + (1 - distanceSmoothingFactor) * previous.value
+        } else {
+            blended = raw
+        }
+
+        smoothedDistances[key] = (blended, now)
+        return blended
+    }
+
+    private func trackKey(label: String, boundingBox: CGRect) -> String {
+        let gridX = Int((boundingBox.midX * 6).rounded(.down))
+        let gridY = Int((boundingBox.midY * 6).rounded(.down))
+        return "\(label)#\(gridX)x\(gridY)"
+    }
+
+    private func pruneSmoothedDistances(now: Date) {
+        smoothedDistances = smoothedDistances.filter { now.timeIntervalSince($0.value.timestamp) < distanceTrackTTL }
+    }
+
+    /// 트랙별 연속 관측 횟수를 갱신하고, 안내해도 좋은(연속 관측이 충분한) 트랙 키 집합을 반환한다.
+    /// 짧게 깜빡이는 오탐은 관측이 누적되지 못해 자연히 제외된다. processingQueue에서만 호출된다.
+    private func updateTrackObservations(_ detections: [DetectedObject], now: Date) -> Set<String> {
+        var stableKeys: Set<String> = []
+
+        for detection in detections {
+            let key = trackKey(label: detection.label.lowercased(), boundingBox: detection.boundingBox)
+            let count: Int
+            if let previous = trackObservationCounts[key], now.timeIntervalSince(previous.lastSeen) < distanceTrackTTL {
+                count = previous.count + 1
+            } else {
+                count = 1
+            }
+            trackObservationCounts[key] = (count, now)
+            if count >= minObservationsToAnnounce {
+                stableKeys.insert(key)
+            }
+        }
+
+        trackObservationCounts = trackObservationCounts.filter { now.timeIntervalSince($0.value.lastSeen) < distanceTrackTTL }
+        return stableKeys
     }
 
     private func pruneAnnouncements(now: Date) {
         let window = labelAnnouncementCooldown * 2
         labelAnnouncementTimes = labelAnnouncementTimes.filter { now.timeIntervalSince($0.value) < window }
+        lastUrgentAnnouncementTimes = lastUrgentAnnouncementTimes.filter { now.timeIntervalSince($0.value) < window }
     }
 
     private func resetPerformanceMetrics() {

@@ -48,21 +48,27 @@ final class CameraManager: NSObject, ObservableObject {
     @Published private(set) var availableLenses: [CameraLens] = []
     @Published var selectedLens: CameraLens = .wide
     @Published private(set) var activeLens: CameraLens = .wide
+    @Published private(set) var isLiDARSupported: Bool = false
+    @Published private(set) var isDepthDataEnabled: Bool = false
 
     let session = AVCaptureSession()
 
     private let sessionQueue = DispatchQueue(label: "yoloVision.camera.session", qos: .userInitiated)
     private let outputQueue = DispatchQueue(label: "yoloVision.camera.output", qos: .userInitiated)
     private let videoOutput = AVCaptureVideoDataOutput()
+    private let depthOutput = AVCaptureDepthDataOutput()
     private let frameHandlerQueue = DispatchQueue(label: "yoloVision.camera.frame-handler", qos: .userInitiated)
+    private let depthMapQueue = DispatchQueue(label: "yoloVision.camera.depth-map", qos: .userInitiated)
 
     private var isConfigured = false
     private var currentInput: AVCaptureDeviceInput?
-    private var frameHandler: ((CVPixelBuffer) -> Void)?
+    private var frameHandler: ((CVPixelBuffer, CVPixelBuffer?) -> Void)?
+    private var latestDepthMap: CVPixelBuffer?
 
     override init() {
         super.init()
         authorizationState = Self.mapAuthorizationStatus(AVCaptureDevice.authorizationStatus(for: .video))
+        isLiDARSupported = Self.hasLiDARCamera()
         let lenses = Self.discoverAvailableLenses()
         availableLenses = lenses
         if lenses.contains(.wide) {
@@ -99,7 +105,7 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    func setFrameHandler(_ handler: @escaping (CVPixelBuffer) -> Void) {
+    func setFrameHandler(_ handler: @escaping (CVPixelBuffer, CVPixelBuffer?) -> Void) {
         frameHandlerQueue.async {
             self.frameHandler = handler
         }
@@ -184,14 +190,18 @@ final class CameraManager: NSObject, ObservableObject {
                     self.videoOutput.alwaysDiscardsLateVideoFrames = true
                     self.videoOutput.setSampleBufferDelegate(self, queue: self.outputQueue)
 
-                    guard self.session.canAddOutput(self.videoOutput) else {
-                        throw CameraManagerError.cannotAddOutput
+                    if !self.session.outputs.contains(where: { $0 === self.videoOutput }) {
+                        guard self.session.canAddOutput(self.videoOutput) else {
+                            throw CameraManagerError.cannotAddOutput
+                        }
+                        self.session.addOutput(self.videoOutput)
                     }
-                    self.session.addOutput(self.videoOutput)
 
                     if let connection = self.videoOutput.connection(with: .video), connection.isVideoOrientationSupported {
                         connection.videoOrientation = .portrait
                     }
+
+                    try self.configureDepthOutputIfAvailable()
 
                     self.session.commitConfiguration()
                     self.isConfigured = true
@@ -220,7 +230,7 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     private func configureInput(for lens: CameraLens) throws {
-        guard let camera = AVCaptureDevice.default(lens.deviceType, for: .video, position: .back) else {
+        guard let camera = preferredCamera(for: lens) else {
             throw CameraManagerError.lensUnavailable
         }
 
@@ -252,6 +262,7 @@ final class CameraManager: NSObject, ObservableObject {
                 do {
                     self.session.beginConfiguration()
                     try self.configureInput(for: lens)
+                    try self.configureDepthOutputIfAvailable()
                     self.session.commitConfiguration()
                     continuation.resume(returning: ())
                 } catch {
@@ -265,12 +276,74 @@ final class CameraManager: NSObject, ObservableObject {
     private static func discoverAvailableLenses() -> [CameraLens] {
         var result: [CameraLens] = []
         for lens in CameraLens.allCases {
-            let hasLens = AVCaptureDevice.default(lens.deviceType, for: .video, position: .back) != nil
+            let hasLens = lens == .wide
+                ? preferredWideCamera() != nil
+                : AVCaptureDevice.default(lens.deviceType, for: .video, position: .back) != nil
             if hasLens {
                 result.append(lens)
             }
         }
         return result
+    }
+
+    private static func hasLiDARCamera() -> Bool {
+        AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: .back) != nil
+    }
+
+    private static func preferredWideCamera() -> AVCaptureDevice? {
+        AVCaptureDevice.default(.builtInLiDARDepthCamera, for: .video, position: .back)
+            ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+    }
+
+    private func preferredCamera(for lens: CameraLens) -> AVCaptureDevice? {
+        switch lens {
+        case .wide:
+            return Self.preferredWideCamera()
+        case .ultraWide, .telephoto:
+            return AVCaptureDevice.default(lens.deviceType, for: .video, position: .back)
+        }
+    }
+
+    private func configureDepthOutputIfAvailable() throws {
+        guard let camera = currentInput?.device else {
+            updateDepthStreaming(enabled: false)
+            return
+        }
+
+        let supportsDepth = !camera.activeFormat.supportedDepthDataFormats.isEmpty
+        guard supportsDepth else {
+            if session.outputs.contains(where: { $0 === depthOutput }) {
+                session.removeOutput(depthOutput)
+            }
+            depthOutput.setDelegate(nil, callbackQueue: nil)
+            depthMapQueue.sync { latestDepthMap = nil }
+            updateDepthStreaming(enabled: false)
+            return
+        }
+
+        if !session.outputs.contains(where: { $0 === depthOutput }) {
+            guard session.canAddOutput(depthOutput) else {
+                throw CameraManagerError.cannotAddDepthOutput
+            }
+            session.addOutput(depthOutput)
+        }
+
+        depthOutput.isFilteringEnabled = true
+        depthOutput.alwaysDiscardsLateDepthData = true
+        depthOutput.setDelegate(self, callbackQueue: outputQueue)
+
+        if let depthConnection = depthOutput.connection(with: .depthData), depthConnection.isVideoOrientationSupported {
+            depthConnection.videoOrientation = .portrait
+        }
+
+        depthMapQueue.sync { latestDepthMap = nil }
+        updateDepthStreaming(enabled: true)
+    }
+
+    private func updateDepthStreaming(enabled: Bool) {
+        Task { @MainActor in
+            self.isDepthDataEnabled = enabled
+        }
     }
 
     private static func mapAuthorizationStatus(_ status: AVAuthorizationStatus) -> CameraAuthorizationState {
@@ -289,16 +362,29 @@ final class CameraManager: NSObject, ObservableObject {
     }
 }
 
-extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
+extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureDepthDataOutputDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard output === videoOutput else { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let depthMap = depthMapQueue.sync { latestDepthMap }
 
         frameHandlerQueue.async {
-            self.frameHandler?(pixelBuffer)
+            self.frameHandler?(pixelBuffer, depthMap)
         }
 
         Task { @MainActor in
             self.frameCounter += 1
+        }
+    }
+
+    func depthDataOutput(_ output: AVCaptureDepthDataOutput, didOutput depthData: AVDepthData, timestamp: CMTime, connection: AVCaptureConnection) {
+        let convertedDepth = depthData.depthDataType == kCVPixelFormatType_DepthFloat32
+            ? depthData
+            : depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
+
+        let depthMap = convertedDepth.depthDataMap
+        depthMapQueue.async {
+            self.latestDepthMap = depthMap
         }
     }
 }
@@ -308,6 +394,7 @@ private enum CameraManagerError: LocalizedError {
     case lensUnavailable
     case cannotAddInput
     case cannotAddOutput
+    case cannotAddDepthOutput
 
     var errorDescription: String? {
         switch self {
@@ -319,6 +406,8 @@ private enum CameraManagerError: LocalizedError {
             return "카메라 입력을 세션에 추가할 수 없습니다."
         case .cannotAddOutput:
             return "프레임 출력을 세션에 추가할 수 없습니다."
+        case .cannotAddDepthOutput:
+            return "Depth 출력을 세션에 추가할 수 없습니다."
         }
     }
 }

@@ -8,5 +8,6 @@ struct DetectedObject: Identifiable, Equatable {
     let confidence: Float
     let boundingBox: CGRect
     let imageSize: CGSize
+    let estimatedDistanceMeters: Float?
     let timestamp: Date
 }
